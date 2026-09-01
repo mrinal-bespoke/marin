@@ -116,6 +116,31 @@ def expected_chat_steps(total_tokens: int) -> int:
     return math.ceil(total_tokens / (SNOWBALL_CHAT_SEQUENCE_LENGTH * SNOWBALL_CHAT_BATCH_SIZE))
 
 
+def run_distributed_probe(expected_devices: int) -> None:
+    """Initialize JAX from Slurm and verify a cross-process collective."""
+    import jax  # noqa: PLC0415
+    import jax.numpy as jnp  # noqa: PLC0415
+    from jax import lax  # noqa: PLC0415
+    from levanter.distributed import DistributedConfig  # noqa: PLC0415
+
+    DistributedConfig().initialize()
+    if jax.device_count() != expected_devices:
+        raise RuntimeError(f"Expected {expected_devices} global devices, found {jax.device_count()}.")
+    if jax.local_device_count() != 1:
+        raise RuntimeError(f"Expected one local device per Vista rank, found {jax.local_device_count()}.")
+
+    local_value = jnp.asarray([jax.process_index() + 1], dtype=jnp.int32)
+    reduced = jax.pmap(lambda value: lax.psum(value, "devices"), axis_name="devices")(local_value)
+    expected_sum = expected_devices * (expected_devices + 1) // 2
+    actual_sum = int(reduced[0])
+    if actual_sum != expected_sum:
+        raise RuntimeError(f"Collective returned {actual_sum}, expected {expected_sum}.")
+    if jax.process_index() == 0:
+        click.echo(f"global_devices={jax.device_count()}")
+        click.echo(f"collective_sum={actual_sum}")
+        click.echo("SNOWBALL_DISTRIBUTED_PROBE_OK")
+
+
 def snowball_chat_run_config(
     *,
     init_checkpoint_path: str,
@@ -201,6 +226,12 @@ def prepare_data_command(parquet_glob: str, cache_path: str, tokenizer_path: str
     click.echo(f"total_tokens={total_tokens}")
     click.echo(f"full_epoch_steps={expected_chat_steps(total_tokens)}")
     click.echo("SNOWBALL_CHAT_CACHE_OK")
+
+
+@main.command("distributed-probe")
+@click.option("--expected-devices", type=click.IntRange(min=2), required=True)
+def distributed_probe_command(expected_devices: int) -> None:
+    run_distributed_probe(expected_devices)
 
 
 @main.command("train")
