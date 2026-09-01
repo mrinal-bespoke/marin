@@ -32,6 +32,7 @@ def test_importer_cli_loads() -> None:
     assert "output_path" in result.stdout
     assert "distributed" in result.stdout
     assert "expert_axis_size" in result.stdout
+    assert "validate_only" in result.stdout
 
 
 def test_importer_cli_parses_distributed_geometry() -> None:

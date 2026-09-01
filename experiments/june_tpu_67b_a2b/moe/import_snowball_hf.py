@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from haliax.partitioning import set_mesh
 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
-from levanter.checkpoint import save_checkpoint
+from levanter.checkpoint import load_checkpoint, save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef
 from levanter.distributed import DistributedConfig
 from levanter.grug.sharding import compact_grug_mesh
@@ -347,6 +347,54 @@ class ImportSnowballHfConfig:
     replica_axis_size: int = 1
     model_axis_size: int = 1
 
+    validate_only: bool = False
+    """Fresh-process restore and value checks without reading the HF source."""
+
+
+def validate_native_checkpoint(checkpoint_path: str, model_config: GrugModelConfig, mesh: jax.sharding.Mesh) -> None:
+    template = eqx.filter_eval_shape(Transformer.init, model_config, key=jax.random.PRNGKey(0))
+    pending_template = jax.ShapeDtypeStruct((model_config.num_layers, model_config.num_experts), jnp.float32)
+    exemplar: dict[str, object] = {"params": template, "pending_qb_betas": pending_template}
+    loaded = cast(
+        dict[str, Any],
+        load_checkpoint(exemplar, checkpoint_path, mesh=mesh, allow_partial=False),
+    )
+    jax.block_until_ready(loaded)
+
+    params = cast(Transformer, loaded["params"])
+    if params.stacked_blocks is None:
+        raise ValueError("Restored Snowball model is missing ArrayStacked blocks.")
+    arrays = [leaf for leaf in jax.tree.leaves(params) if isinstance(leaf, jax.Array)]
+    parameter_count = sum(array.size for array in arrays)
+    if parameter_count != 67_078_882_816:
+        raise ValueError(f"Restored {parameter_count} parameters; expected 67,078,882,816.")
+
+    representative = {
+        "token_embed": params.token_embed,
+        "output_proj": params.output_proj,
+        "attention_q": params.stacked_blocks.stacked.attn.w_q,
+        "expert_gate": params.stacked_blocks.stacked.mlp.expert_mlp.w_gate,
+    }
+    metrics: dict[str, float] = {}
+    for name, array in representative.items():
+        finite = bool(jax.device_get(jnp.all(jnp.isfinite(array))))
+        mean_abs = float(jax.device_get(jnp.mean(jnp.abs(array.astype(jnp.float32)))))
+        if not finite or not mean_abs > 0.0:
+            raise ValueError(f"Restored {name} failed value check: finite={finite}, mean_abs={mean_abs}.")
+        metrics[name] = mean_abs
+
+    pending_qb_betas = cast(jax.Array, loaded["pending_qb_betas"])
+    pending_max = float(jax.device_get(jnp.max(jnp.abs(pending_qb_betas))))
+    if pending_max != 0.0:
+        raise ValueError(f"Restored pending_qb_betas must be exactly zero, got max abs {pending_max}.")
+
+    if jax.process_index() == 0:
+        print(f"parameter_count={parameter_count}")
+        for name, mean_abs in metrics.items():
+            print(f"{name}_mean_abs={mean_abs:.9g}")
+        print("pending_qb_betas_max_abs=0")
+        print("SNOWBALL_NATIVE_LOAD_OK")
+
 
 def main(config: ImportSnowballHfConfig) -> None:
     start = time.monotonic()
@@ -355,9 +403,6 @@ def main(config: ImportSnowballHfConfig) -> None:
     if not model_config.use_array_stacked_blocks:
         raise ValueError("The Snowball SFT model config must use ArrayStacked blocks.")
 
-    source = RepoRef.from_string(config.hf_checkpoint)
-    converter = _hf_config(model_config).hf_checkpoint_converter(ref_checkpoint=str(source))
-    logger.info("Loading public Snowball HF tensors from %s", source)
     if config.distributed:
         DistributedConfig().initialize()
     device_context = contextlib.nullcontext() if config.distributed else use_cpu_device()
@@ -368,6 +413,13 @@ def main(config: ImportSnowballHfConfig) -> None:
             model_axis_size=config.model_axis_size,
         )
         with set_mesh(mesh):
+            if config.validate_only:
+                validate_native_checkpoint(config.output_path, model_config, mesh)
+                return
+
+            source = RepoRef.from_string(config.hf_checkpoint)
+            converter = _hf_config(model_config).hf_checkpoint_converter(ref_checkpoint=str(source))
+            logger.info("Loading public Snowball HF tensors from %s", source)
             state_dict = converter.load_state_dict(source, dtype=dtype)
             template = eqx.filter_eval_shape(Transformer.init, model_config, key=jax.random.PRNGKey(0))
             params, pending_qb_betas = snowball_from_hf_state_dict(template, state_dict)
