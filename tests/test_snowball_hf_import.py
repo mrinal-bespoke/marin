@@ -4,6 +4,7 @@
 import subprocess
 import sys
 
+import draccus
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,7 @@ from haliax.partitioning import set_mesh
 from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.june_tpu_67b_a2b.moe.import_snowball_hf import (
+    ImportSnowballHfConfig,
     snowball_from_hf_state_dict,
     snowball_hf_state_dict,
 )
@@ -28,6 +30,26 @@ def test_importer_cli_loads() -> None:
     assert result.returncode == 0, result.stderr
     assert "hf_checkpoint" in result.stdout
     assert "output_path" in result.stdout
+    assert "distributed" in result.stdout
+    assert "expert_axis_size" in result.stdout
+
+
+def test_importer_cli_parses_distributed_geometry() -> None:
+    config = draccus.parse(
+        ImportSnowballHfConfig,
+        args=[
+            "--hf_checkpoint",
+            "/input",
+            "--output_path",
+            "/output",
+            "--distributed",
+            "true",
+            "--expert_axis_size",
+            "8",
+        ],
+    )
+    assert config.distributed
+    assert config.expert_axis_size == 8
 
 
 def _tiny_model() -> Transformer:

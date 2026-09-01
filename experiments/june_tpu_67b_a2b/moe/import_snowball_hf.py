@@ -12,6 +12,7 @@ does not apply the exported bias a second time.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import time
@@ -27,6 +28,7 @@ from haliax.partitioning import set_mesh
 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 from levanter.checkpoint import save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef
+from levanter.distributed import DistributedConfig
 from levanter.grug.sharding import compact_grug_mesh
 from levanter.utils.jax_utils import use_cpu_device
 
@@ -338,6 +340,13 @@ class ImportSnowballHfConfig:
 
     dtype: str = "bfloat16"
 
+    distributed: bool = False
+    """Shard the conversion over the Slurm/JAX processes instead of one CPU."""
+
+    expert_axis_size: int = 1
+    replica_axis_size: int = 1
+    model_axis_size: int = 1
+
 
 def main(config: ImportSnowballHfConfig) -> None:
     start = time.monotonic()
@@ -349,8 +358,15 @@ def main(config: ImportSnowballHfConfig) -> None:
     source = RepoRef.from_string(config.hf_checkpoint)
     converter = _hf_config(model_config).hf_checkpoint_converter(ref_checkpoint=str(source))
     logger.info("Loading public Snowball HF tensors from %s", source)
-    with use_cpu_device():
-        mesh = compact_grug_mesh(expert_axis_size=1, replica_axis_size=1, model_axis_size=1)
+    if config.distributed:
+        DistributedConfig().initialize()
+    device_context = contextlib.nullcontext() if config.distributed else use_cpu_device()
+    with device_context:
+        mesh = compact_grug_mesh(
+            expert_axis_size=config.expert_axis_size,
+            replica_axis_size=config.replica_axis_size,
+            model_axis_size=config.model_axis_size,
+        )
         with set_mesh(mesh):
             state_dict = converter.load_state_dict(source, dtype=dtype)
             template = eqx.filter_eval_shape(Transformer.init, model_config, key=jax.random.PRNGKey(0))

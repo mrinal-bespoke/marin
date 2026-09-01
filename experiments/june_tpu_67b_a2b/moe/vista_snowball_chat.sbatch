@@ -8,7 +8,8 @@
 #SBATCH --exclude=c610-021,c611-011,c640-041,c611-041,c611-122,c637-082,c636-121,c635-101,c641-061,c611-051,c636-152,c608-042,c634-142,c641-012,c634-052,c621-102,c637-042,c638-101,c638-102,c638-112
 
 # Run with SNOWBALL_MODE=distributed-probe and `sbatch --nodes=8` for the
-# multi-node fabric gate. The default mode launches a 64-device Chat run.
+# multi-node fabric gate, or SNOWBALL_MODE=import and `sbatch --nodes=32` for
+# the memory-sharded HF-to-native conversion. The default mode launches Chat.
 
 set -euo pipefail
 
@@ -47,6 +48,17 @@ if [[ "${SNOWBALL_MODE}" == "distributed-probe" ]]; then
   srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
     "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat \
       distributed-probe --expected-devices "${SLURM_NTASKS}"
+elif [[ "${SNOWBALL_MODE}" == "import" ]]; then
+  : "${SNOWBALL_HF_CHECKPOINT:?Set SNOWBALL_HF_CHECKPOINT to the pinned local HF snapshot.}"
+  : "${SNOWBALL_INIT:?Set SNOWBALL_INIT to the new native step-0 checkpoint path.}"
+  srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
+    "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.import_snowball_hf \
+      --hf_checkpoint "${SNOWBALL_HF_CHECKPOINT}" \
+      --output_path "${SNOWBALL_INIT}" \
+      --distributed true \
+      --expert_axis_size 8 \
+      --replica_axis_size 1 \
+      --model_axis_size 1
 elif [[ "${SNOWBALL_MODE}" == "train" ]]; then
   : "${SNOWBALL_INIT:?Set SNOWBALL_INIT to the native weights-only checkpoint root.}"
   : "${SNOWBALL_CACHE:?Set SNOWBALL_CACHE to the packed WildChat cache.}"
@@ -64,6 +76,6 @@ elif [[ "${SNOWBALL_MODE}" == "train" ]]; then
       --steps "${SNOWBALL_STEPS}" \
       --devices "${SLURM_NTASKS}"
 else
-  echo "FATAL: SNOWBALL_MODE must be distributed-probe or train, got ${SNOWBALL_MODE}." >&2
+  echo "FATAL: SNOWBALL_MODE must be distributed-probe, import, or train; got ${SNOWBALL_MODE}." >&2
   exit 2
 fi
