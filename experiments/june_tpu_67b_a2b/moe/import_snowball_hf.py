@@ -35,7 +35,7 @@ from experiments.grug.moe.model import GrugModelConfig as HfGrugModelConfig
 from experiments.grug.moe.model import Transformer as HfTransformer
 from experiments.grug.moe.model import grugmoe_inference_state_dict
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, Transformer
-from experiments.june_tpu_67b_a2b.moe.sft_67b_a2b_2stage import _model as SNOWBALL_SFT_MODEL_CONFIG
+from experiments.june_tpu_67b_a2b.moe.snowball_chat_recipe import SNOWBALL_CHAT_MODEL_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +343,7 @@ class ImportSnowballHfConfig:
 def main(config: ImportSnowballHfConfig) -> None:
     start = time.monotonic()
     dtype = getattr(jnp, config.dtype)
-    model_config = SNOWBALL_SFT_MODEL_CONFIG
+    model_config = SNOWBALL_CHAT_MODEL_CONFIG
     if not model_config.use_array_stacked_blocks:
         raise ValueError("The Snowball SFT model config must use ArrayStacked blocks.")
 
