@@ -23,7 +23,6 @@ import draccus
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import levanter
 from haliax.partitioning import set_mesh
 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 from levanter.checkpoint import save_checkpoint
@@ -371,4 +370,4 @@ def main(config: ImportSnowballHfConfig) -> None:
 
 
 if __name__ == "__main__":
-    levanter.config.main(main)()
+    main(draccus.parse(ImportSnowballHfConfig))

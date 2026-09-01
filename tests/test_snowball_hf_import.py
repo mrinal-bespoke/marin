@@ -1,6 +1,9 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -13,6 +16,18 @@ from experiments.june_tpu_67b_a2b.moe.import_snowball_hf import (
     snowball_hf_state_dict,
 )
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, Transformer
+
+
+def test_importer_cli_loads() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "experiments.june_tpu_67b_a2b.moe.import_snowball_hf", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "hf_checkpoint" in result.stdout
+    assert "output_path" in result.stdout
 
 
 def _tiny_model() -> Transformer:
