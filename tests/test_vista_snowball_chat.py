@@ -3,6 +3,8 @@
 
 import math
 
+import pytest
+
 from experiments.june_tpu_67b_a2b.moe.sft_67b_a2b_2stage import _model as ORIGINAL_MODEL_CONFIG
 from experiments.june_tpu_67b_a2b.moe.sft_67b_a2b_2stage import _optimizer as ORIGINAL_OPTIMIZER
 from experiments.june_tpu_67b_a2b.moe.vista_snowball_chat import (
@@ -17,6 +19,7 @@ from experiments.june_tpu_67b_a2b.moe.vista_snowball_chat import (
     SNOWBALL_CHAT_STEPS,
     expected_chat_steps,
     snowball_chat_format,
+    validate_chat_epoch,
 )
 from experiments.sft.delphi_chat_template import DELPHI_V0_CHAT_TEMPLATE
 
@@ -54,3 +57,9 @@ def test_epoch_step_count_uses_packed_token_count() -> None:
         total_tokens / (SNOWBALL_CHAT_SEQUENCE_LENGTH * SNOWBALL_CHAT_BATCH_SIZE)
     )
     assert expected_chat_steps(total_tokens) == 257
+    assert validate_chat_epoch(total_tokens) == 257
+
+
+def test_epoch_gate_rejects_cache_drift() -> None:
+    with pytest.raises(ValueError, match="requires 257"):
+        validate_chat_epoch(536_000_000)

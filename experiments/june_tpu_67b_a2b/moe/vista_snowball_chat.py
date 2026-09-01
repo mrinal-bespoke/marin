@@ -116,6 +116,16 @@ def expected_chat_steps(total_tokens: int) -> int:
     return math.ceil(total_tokens / (SNOWBALL_CHAT_SEQUENCE_LENGTH * SNOWBALL_CHAT_BATCH_SIZE))
 
 
+def validate_chat_epoch(total_tokens: int) -> int:
+    steps = expected_chat_steps(total_tokens)
+    if steps != SNOWBALL_CHAT_STEPS:
+        raise ValueError(
+            f"Packed WildChat cache resolves to {steps} steps, but the pinned Snowball Chat contract requires "
+            f"{SNOWBALL_CHAT_STEPS}."
+        )
+    return steps
+
+
 def run_distributed_probe(expected_devices: int) -> None:
     """Initialize JAX from Slurm and verify a cross-process collective."""
     import jax  # noqa: PLC0415
@@ -154,7 +164,7 @@ def snowball_chat_run_config(
     if devices != SNOWBALL_CHAT_DEVICES:
         raise ValueError(f"Snowball Chat requires {SNOWBALL_CHAT_DEVICES} devices, got {devices}.")
     total_tokens = read_chat_cache_tokens(data_cache_path)
-    full_epoch_steps = expected_chat_steps(total_tokens)
+    full_epoch_steps = validate_chat_epoch(total_tokens)
     if steps > full_epoch_steps:
         raise ValueError(f"Requested {steps} steps, but the packed WildChat epoch has only {full_epoch_steps} steps.")
 
@@ -224,7 +234,7 @@ def prepare_data_command(parquet_glob: str, cache_path: str, tokenizer_path: str
         tokenizer_path=tokenizer_path,
     )
     click.echo(f"total_tokens={total_tokens}")
-    click.echo(f"full_epoch_steps={expected_chat_steps(total_tokens)}")
+    click.echo(f"full_epoch_steps={validate_chat_epoch(total_tokens)}")
     click.echo("SNOWBALL_CHAT_CACHE_OK")
 
 
