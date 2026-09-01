@@ -37,4 +37,5 @@ srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --
     --distributed true \
     --expert_axis_size 1 \
     --replica_axis_size 1 \
-    --model_axis_size 1
+    --model_axis_size 1 \
+    --validate_only "${SNOWBALL_VALIDATE_ONLY:-false}"
