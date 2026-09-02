@@ -5,6 +5,7 @@
 # * Orbax: https://github.com/google/orbax/blob/11d2934ecfff77e86b5e07d0fef02b67eff4511b/orbax/checkpoint/pytree_checkpoint_handler.py#L312
 import asyncio
 import collections
+import itertools
 import logging
 import math
 import os
@@ -101,23 +102,25 @@ def build_kvstore_spec(path: str) -> dict:
         raise ValueError(f"Unsupported URI scheme for tensorstore: {parsed.scheme!r} in {path!r}")
 
 
-def _slice_shard_on_device(data, axis: int, start: int, limit: int):
+def _slice_shard_on_device(data, index: tuple[slice, ...]):
     """Slice a single-device shard under a one-device mesh.
 
     A training mesh rejects the single-device operand. Orbax does the same.
     """
     shard_mesh = jax.sharding.Mesh(np.array(list(data.sharding.device_set)), ("shard",))
     with jax.sharding.set_mesh(shard_mesh):
-        return jax.lax.slice_in_dim(data, start_index=start, limit_index=limit, axis=axis)
+        starts = tuple(0 if entry.start is None else entry.start for entry in index)
+        limits = tuple(size if entry.stop is None else entry.stop for entry, size in zip(index, data.shape))
+        return jax.lax.slice(data, starts, limits)
 
 
-async def _transfer_shard_to_pageable_host(shard, local_slice: tuple[int, int, int] | None = None) -> np.ndarray:
-    """Snapshot a shard into pageable host memory, restricted to ``local_slice``.
+async def _transfer_shard_to_pageable_host(shard, local_index: tuple[slice, ...] | None = None) -> np.ndarray:
+    """Snapshot a shard into pageable host memory, restricted to ``local_index``.
 
     The TPU runtime never returns JAX's pinned staging to the OS (#6924). State already in
     host memory is snapshotted in place.
     """
-    data = shard.data if local_slice is None else _slice_shard_on_device(shard.data, *local_slice)
+    data = shard.data if local_index is None else _slice_shard_on_device(shard.data, local_index)
     if getattr(data.sharding, "memory_kind", None) != _HOST_MEMORY_KIND:
         data.copy_to_host_async()
         # Yield so the remaining shards' copies can be enqueued before this one blocks.
@@ -178,16 +181,8 @@ class _ShardWrite:
 
     index: tuple
     """Index into the global array."""
-    slice_axis: int | None
-    """Axis the shard is sliced along, or None to write the whole shard."""
-    slice_start: int
-    slice_limit: int
-
-    @property
-    def local_slice(self) -> tuple[int, int, int] | None:
-        if self.slice_axis is None:
-            return None
-        return self.slice_axis, self.slice_start, self.slice_limit
+    local_index: tuple[slice, ...] | None
+    """Index into the device-local shard, or None to write the whole shard."""
 
 
 class _HostStagingGate:
@@ -348,7 +343,7 @@ def _shard_write_region(shard, plan: _WritePlan) -> _ShardWrite | None:
     if plan.split_axis is None:
         if shard.replica_id != plan.writer_replica:
             return None
-        return _ShardWrite(index=shard.index, slice_axis=None, slice_start=0, slice_limit=0)
+        return _ShardWrite(index=shard.index, local_index=None)
 
     if shard.replica_id >= plan.write_replicas:
         return None
@@ -358,10 +353,57 @@ def _shard_write_region(shard, plan: _WritePlan) -> _ShardWrite | None:
     start = (shard.index[axis].start or 0) + local_start
     return _ShardWrite(
         index=shard.index[:axis] + (slice(start, start + plan.block),) + shard.index[axis + 1 :],
-        slice_axis=axis,
-        slice_start=local_start,
-        slice_limit=local_start + plan.block,
+        local_index=tuple(
+            slice(local_start, local_start + plan.block) if i == axis else slice(None) for i in range(len(shard.index))
+        ),
     )
+
+
+def _index_shape(index: tuple, shape: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(
+        1 if isinstance(entry, int) else (shape[axis] if entry.stop is None else entry.stop) - (entry.start or 0)
+        for axis, entry in enumerate(index)
+    )
+
+
+def _shard_write_regions(shard, plan: _WritePlan) -> list[_ShardWrite]:
+    """Split one shard write into chunk-aligned regions.
+
+    TensorStore chunks a large input internally, but the caller must first materialize that
+    entire input on host. Keeping each staged snapshot to one zarr chunk avoids multi-GiB host
+    arrays for large MoE leaves and makes the configured chunk bound real at the staging layer.
+    """
+    region = _shard_write_region(shard, plan)
+    if region is None:
+        return []
+
+    local_shape = tuple(shard.data.shape)
+    region_shape = local_shape if region.local_index is None else _index_shape(region.local_index, local_shape)
+    if region_shape == plan.chunk_shape:
+        return [region]
+
+    global_starts = tuple(entry if isinstance(entry, int) else (entry.start or 0) for entry in region.index)
+    local_base = (
+        tuple(0 for _ in local_shape)
+        if region.local_index is None
+        else tuple(entry.start or 0 for entry in region.local_index)
+    )
+    blocks = [range(0, extent, chunk) for extent, chunk in zip(region_shape, plan.chunk_shape)]
+    writes: list[_ShardWrite] = []
+    for offsets in itertools.product(*blocks):
+        extents = tuple(
+            min(chunk, extent - offset) for offset, extent, chunk in zip(offsets, region_shape, plan.chunk_shape)
+        )
+        global_index = tuple(
+            slice(start + offset, start + offset + extent)
+            for start, offset, extent in zip(global_starts, offsets, extents)
+        )
+        local_index = tuple(
+            slice(start + offset, start + offset + extent)
+            for start, offset, extent in zip(local_base, offsets, extents)
+        )
+        writes.append(_ShardWrite(index=global_index, local_index=local_index))
+    return writes
 
 
 def _process_staged_bytes(array, plan: _WritePlan) -> int:
@@ -611,16 +653,17 @@ def _serialize_arrays(
         await issue_write(_estimate_array_nbytes(array), stage)
 
     async def write_shard(store, shard, plan):
-        region = _shard_write_region(shard, plan)
-        if region is None:
-            return
+        for region in _shard_write_regions(shard, plan):
+            local_shape = tuple(shard.data.shape)
+            region_shape = local_shape if region.local_index is None else _index_shape(region.local_index, local_shape)
+            num_bytes = math.prod(region_shape) * shard.data.dtype.itemsize
 
-        async def stage():
-            data = await _transfer_shard_to_pageable_host(shard, region.local_slice)
-            # The snapshot is private and never mutated, so TensorStore may hold the reference.
-            return store[region.index].write(data, can_reference_source_data_indefinitely=True)
+            async def stage(region=region):
+                data = await _transfer_shard_to_pageable_host(shard, region.local_index)
+                # The snapshot is private and never mutated, so TensorStore may hold the reference.
+                return store[region.index].write(data, can_reference_source_data_indefinitely=True)
 
-        await issue_write(_estimate_array_nbytes(shard.data) // plan.write_replicas, stage)
+            await issue_write(num_bytes, stage)
 
     async def write_one(array, tspec, plan):
         store = await ts.open(ts.Spec(tspec), create=True, open=True, context=context)
