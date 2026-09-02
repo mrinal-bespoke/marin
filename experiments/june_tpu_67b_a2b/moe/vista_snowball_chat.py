@@ -21,7 +21,9 @@ from pathlib import Path
 
 import click
 import jmp
+import numpy as np
 from fray.cluster import ResourceConfig
+from haliax import Axis
 from levanter.checkpoint import CheckpointerConfig, latest_checkpoint_path
 from levanter.data.text.datasets import DatasetComponent, LmDataConfig, UrlDatasetSourceConfig
 from levanter.data.text.formats import ChatLmDatasetFormat
@@ -468,6 +470,36 @@ def run_gpu_kernel_probe() -> None:
     click.echo("SNOWBALL_GPU_KERNEL_PROBE_OK")
 
 
+def run_gpu_runtime_probe(*, data_cache_path: str, tokenizer_path: str) -> None:
+    """Exercise the GPU kernels and the real CPU-sharded token-cache path."""
+    import jax  # noqa: PLC0415
+
+    run_gpu_kernel_probe()
+    datasets = snowball_chat_data_config(
+        cache_path=data_cache_path,
+        tokenizer_path=tokenizer_path,
+    ).train_sets(
+        Axis("position", SNOWBALL_CHAT_SEQUENCE_LENGTH),
+        key=jax.random.PRNGKey(SNOWBALL_CHAT_SEED),
+        initial_batch_size=SNOWBALL_CHAT_BATCH_SIZE,
+    )
+    example = datasets["wildchat_386k"].as_sync_dataset()[0]
+    tokens = np.asarray(example.tokens)
+    loss_weight = np.asarray(example.loss_weight)
+    expected_shape = (SNOWBALL_CHAT_SEQUENCE_LENGTH,)
+    if tokens.shape != expected_shape or loss_weight.shape != expected_shape:
+        raise ValueError(
+            f"Snowball cache example has token/loss shapes {tokens.shape}/{loss_weight.shape}, "
+            f"expected {expected_shape}."
+        )
+    if not np.isfinite(loss_weight).all() or float(loss_weight.sum()) <= 0:
+        raise ValueError("Snowball cache example has invalid or empty assistant loss weights.")
+
+    click.echo(f"example_tokens={tokens.size}")
+    click.echo(f"assistant_loss_tokens={int(np.count_nonzero(loss_weight))}")
+    click.echo("SNOWBALL_GPU_RUNTIME_PROBE_OK")
+
+
 def snowball_chat_run_config(
     *,
     init_checkpoint_path: str,
@@ -564,6 +596,13 @@ def distributed_probe_command(expected_devices: int) -> None:
 @main.command("gpu-kernel-probe")
 def gpu_kernel_probe_command() -> None:
     run_gpu_kernel_probe()
+
+
+@main.command("gpu-runtime-probe")
+@click.option("--data-cache-path", required=True)
+@click.option("--tokenizer-path", required=True)
+def gpu_runtime_probe_command(data_cache_path: str, tokenizer_path: str) -> None:
+    run_gpu_runtime_probe(data_cache_path=data_cache_path, tokenizer_path=tokenizer_path)
 
 
 @main.command("preflight")

@@ -7,9 +7,10 @@
 #SBATCH --job-name=snowball-chat
 #SBATCH --exclude=c610-021,c611-011,c640-041,c611-041,c611-122,c637-082,c636-121,c635-101,c641-061,c611-051,c636-152,c608-042,c634-142,c641-012,c634-052,c621-102,c637-042,c638-101,c638-102,c638-112
 
-# Run with SNOWBALL_MODE=distributed-probe and `sbatch --nodes=8` for the
-# multi-node fabric gate, or SNOWBALL_MODE=import and `sbatch --nodes=32` for
-# the memory-sharded HF-to-native conversion. The default mode launches Chat.
+# Run with SNOWBALL_MODE=runtime-probe on one GH200 to validate GPU kernels and
+# the real cache read, SNOWBALL_MODE=distributed-probe and `sbatch --nodes=8`
+# for the multi-node fabric gate, or SNOWBALL_MODE=import and `sbatch --nodes=32`
+# for the memory-sharded HF-to-native conversion. The default mode launches Chat.
 
 set -euo pipefail
 
@@ -44,7 +45,14 @@ export PYTHONPATH="${MARIN_ROOT}:${MARIN_ROOT}/lib/levanter/src:${MARIN_ROOT}/li
 test -x "${MARIN_PYTHON}"
 cd "${MARIN_ROOT}"
 
-if [[ "${SNOWBALL_MODE}" == "distributed-probe" ]]; then
+if [[ "${SNOWBALL_MODE}" == "runtime-probe" ]]; then
+  : "${SNOWBALL_CACHE:?Set SNOWBALL_CACHE to the packed WildChat cache.}"
+  : "${SNOWBALL_TOKENIZER:?Set SNOWBALL_TOKENIZER to the pinned tokenizer directory.}"
+  "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat \
+    gpu-runtime-probe \
+      --data-cache-path "${SNOWBALL_CACHE}" \
+      --tokenizer-path "${SNOWBALL_TOKENIZER}"
+elif [[ "${SNOWBALL_MODE}" == "distributed-probe" ]]; then
   srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
     "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat \
       distributed-probe --expected-devices "${SLURM_NTASKS}"
@@ -83,6 +91,6 @@ elif [[ "${SNOWBALL_MODE}" == "train" ]]; then
     "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat train \
       "${preflight_args[@]}"
 else
-  echo "FATAL: SNOWBALL_MODE must be distributed-probe, import, or train; got ${SNOWBALL_MODE}." >&2
+  echo "FATAL: SNOWBALL_MODE must be runtime-probe, distributed-probe, import, or train; got ${SNOWBALL_MODE}." >&2
   exit 2
 fi
