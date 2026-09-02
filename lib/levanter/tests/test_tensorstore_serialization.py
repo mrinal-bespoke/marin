@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -66,6 +67,16 @@ def test_tensorstore_checkpoint_roundtrips_multi_axis_chunk_staging():
         restored = tree_deserialize_leaves_tensorstore(tmpdir, {"source": jnp.zeros_like(source)})
 
     np.testing.assert_array_equal(restored["source"], source)
+
+
+def test_tensorstore_checkpoint_uses_numbered_ocdbt_manifests():
+    with TemporaryDirectory() as tmpdir:
+        tree_serialize_leaves_tensorstore(tmpdir, {"source": jnp.arange(8)})
+
+        manifests = {path.name for path in Path(tmpdir).glob("manifest.*")}
+
+    assert "manifest.ocdbt" in manifests
+    assert any(name != "manifest.ocdbt" for name in manifests)
 
 
 def test_tensorstore_checkpoint_simple():

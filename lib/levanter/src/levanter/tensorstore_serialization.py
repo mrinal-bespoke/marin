@@ -433,6 +433,12 @@ def _create_ocdbt_spec(
         "kvstore": {"driver": KVSTORE_DRIVER, "base": build_kvstore_spec(checkpoint_root)},
     }
 
+    if entry is not None:
+        # A numbered manifest gives every concurrent commit its own immutable file. This is
+        # required on shared filesystems where replacing and locking one manifest.ocdbt from
+        # multiple hosts is not reliable.
+        spec["kvstore"]["config"] = {"manifest_kind": "numbered"}
+
     if array_path:
         spec["kvstore"]["path"] = array_path
 
@@ -452,6 +458,18 @@ async def _list_ocdbt_keys(checkpoint_root: str) -> list[str]:
     kvstore = await ts.KvStore.open(kvstore_spec)
     keys_bytes = await kvstore.list()
     return [key.decode("utf-8") for key in keys_bytes]
+
+
+async def _initialize_ocdbt(checkpoint_root: str) -> None:
+    """Create the numbered OCDBT database before distributed writers open arrays."""
+    kvstore = await ts.KvStore.open(
+        {
+            "driver": KVSTORE_DRIVER,
+            "base": build_kvstore_spec(checkpoint_root),
+            "config": {"manifest_kind": "numbered"},
+        }
+    )
+    await kvstore.write(b".checkpoint_init", b"")
 
 
 def _is_named_or_none(x):
@@ -582,6 +600,11 @@ def tree_serialize_leaves_tensorstore(
         write_manifest(
             checkpoint_dir, build_manifest(entries, array_driver=ARRAY_DRIVER, kvstore_driver=KVSTORE_DRIVER)
         )
+        asyncio.run(_initialize_ocdbt(checkpoint_dir))
+
+    # The numbered database still has one immutable configuration manifest. Ensure rank 0
+    # creates it before any other rank opens an array, then all commits use distinct files.
+    jax.experimental.multihost_utils.sync_global_devices(f"ocdbt_initialized:{checkpoint_dir}")
 
     # Pre-charge the cross-region budget: tensorstore bypasses fsspec, so CrossRegionGuardedFS
     # never sees these bytes. No-op for a local or same-region checkpoint_dir.
