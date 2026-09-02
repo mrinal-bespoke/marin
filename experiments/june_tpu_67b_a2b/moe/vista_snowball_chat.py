@@ -14,6 +14,8 @@ import dataclasses
 import glob
 import json
 import math
+import os
+import shutil
 from datetime import timedelta
 from pathlib import Path
 
@@ -27,10 +29,12 @@ from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
 from levanter.utils.mesh import MeshConfig
 from rigging.filesystem import prefix_join
+from transformers import AutoTokenizer
 
 from experiments.june_tpu_67b_a2b.moe.snowball_chat_recipe import (
     SNOWBALL_CHAT_BATCH_SIZE,
     SNOWBALL_CHAT_DEVICES,
+    SNOWBALL_CHAT_EXAMPLES,
     SNOWBALL_CHAT_EXPERT_PARALLEL,
     SNOWBALL_CHAT_MODEL_AXIS,
     SNOWBALL_CHAT_MODEL_CONFIG,
@@ -40,9 +44,14 @@ from experiments.june_tpu_67b_a2b.moe.snowball_chat_recipe import (
     SNOWBALL_CHAT_SEED,
     SNOWBALL_CHAT_SEQUENCE_LENGTH,
     SNOWBALL_CHAT_STEPS,
+    SNOWBALL_CHAT_TOKENS,
+    SNOWBALL_NATIVE_PARAMETERS,
 )
 from experiments.june_tpu_67b_a2b.moe.train import GrugRunConfig, GrugTrainerConfig, run_grug_local
 from experiments.sft.delphi_chat_template import DELPHI_V0_CHAT_TEMPLATE
+
+_MINIMUM_OUTPUT_FREE_BYTES = 1_000_000_000_000
+_MINIMUM_OUTPUT_FREE_INODES = 10_000
 
 
 def snowball_chat_format() -> ChatLmDatasetFormat:
@@ -88,6 +97,263 @@ def read_chat_cache_tokens(cache_path: str) -> int:
     if not isinstance(total_tokens, int) or total_tokens <= 0:
         raise ValueError(f"Invalid total_tokens in {stats_path}: {total_tokens!r}")
     return total_tokens
+
+
+@dataclasses.dataclass(frozen=True)
+class SnowballChatPreflight:
+    """Static artifacts and geometry accepted by the Vista launch gate."""
+
+    init_checkpoint_path: str
+    init_payload_files: int
+    init_payload_bytes: int
+    cache_tokens: int
+    cache_examples: int
+    cache_shards: int
+    tokenizer_vocab_size: int
+    data_axis_size: int
+    per_device_batch_size: int
+    output_free_bytes: int
+    output_free_inodes: int
+    output_checkpoint_path: str | None
+
+
+def _json_object(path: Path) -> dict[str, object]:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in {path}.")
+    return value
+
+
+def validate_native_checkpoint_layout(init_checkpoint_path: str) -> tuple[str, int, int]:
+    """Resolve a complete Snowball step-0 checkpoint and measure its payload."""
+    if not Path(init_checkpoint_path).is_absolute():
+        raise ValueError(f"Snowball init checkpoint path must be absolute: {init_checkpoint_path!r}.")
+
+    resolved_path = latest_checkpoint_path(init_checkpoint_path)
+    checkpoint_path = Path(resolved_path)
+    metadata = _json_object(checkpoint_path / "metadata.json")
+    if metadata.get("step") != 0:
+        raise ValueError(f"Snowball base checkpoint must be step 0, got {metadata.get('step')!r} in {resolved_path}.")
+
+    manifest_path = checkpoint_path / "manifest.ocdbt"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Snowball base checkpoint is missing {manifest_path}.")
+    numbered_manifests = [
+        path
+        for path in checkpoint_path.glob("manifest.*")
+        if path.name not in {"manifest.json", "manifest.ocdbt"} and path.is_file()
+    ]
+    if not numbered_manifests:
+        raise FileNotFoundError(f"Snowball base checkpoint has no numbered OCDBT manifests in {resolved_path}.")
+
+    payload_path = checkpoint_path / "d"
+    payload_files = [path for path in payload_path.rglob("*") if path.is_file()]
+    payload_bytes = sum(path.stat().st_size for path in payload_files)
+    minimum_payload_bytes = SNOWBALL_NATIVE_PARAMETERS * 2
+    if not payload_files or payload_bytes < minimum_payload_bytes:
+        raise ValueError(
+            f"Snowball base checkpoint payload is incomplete: {len(payload_files)} files and {payload_bytes} bytes; "
+            f"expected at least {minimum_payload_bytes} bytes."
+        )
+    return resolved_path, len(payload_files), payload_bytes
+
+
+def validate_chat_cache_layout(data_cache_path: str) -> tuple[int, int, int]:
+    """Validate the exact completed WildChat cache used by the Chat recipe."""
+    cache_path = Path(data_cache_path)
+    if not cache_path.is_absolute():
+        raise ValueError(f"Snowball data cache path must be absolute: {data_cache_path!r}.")
+
+    train_path = cache_path / "train"
+    stats = _json_object(train_path / ".stats.json")
+    total_tokens = stats.get("total_tokens")
+    total_examples = stats.get("total_elements")
+    if total_tokens != SNOWBALL_CHAT_TOKENS or total_examples != SNOWBALL_CHAT_EXAMPLES:
+        raise ValueError(
+            f"Packed WildChat cache has {total_tokens!r} tokens and {total_examples!r} examples; expected "
+            f"{SNOWBALL_CHAT_TOKENS} tokens and {SNOWBALL_CHAT_EXAMPLES} examples."
+        )
+
+    ledger = _json_object(train_path / "shard_ledger.json")
+    shard_rows = ledger.get("shard_rows")
+    finished_shards = ledger.get("finished_shards")
+    field_counts = ledger.get("field_counts")
+    if not isinstance(shard_rows, dict) or not isinstance(finished_shards, list):
+        raise ValueError(f"Packed WildChat cache has a malformed shard ledger at {train_path}.")
+    if not all(isinstance(shard, str) for shard in finished_shards) or not all(
+        isinstance(shard, str) and isinstance(rows, int) for shard, rows in shard_rows.items()
+    ):
+        raise ValueError(f"Packed WildChat cache has malformed shard names or row counts at {train_path}.")
+    typed_finished_shards = [str(shard) for shard in finished_shards]
+    typed_shard_rows = {str(shard): int(rows) for shard, rows in shard_rows.items()}
+    if ledger.get("is_finished") is not True or set(typed_finished_shards) != set(typed_shard_rows):
+        raise ValueError(f"Packed WildChat cache is not fully committed at {train_path}.")
+    if sum(typed_shard_rows.values()) != SNOWBALL_CHAT_EXAMPLES:
+        raise ValueError(f"Packed WildChat cache shard rows do not sum to {SNOWBALL_CHAT_EXAMPLES}.")
+    if field_counts != {"assistant_masks": SNOWBALL_CHAT_TOKENS, "input_ids": SNOWBALL_CHAT_TOKENS}:
+        raise ValueError(f"Packed WildChat cache field counts are invalid: {field_counts!r}.")
+
+    for shard in typed_finished_shards:
+        shard_path = train_path / shard
+        if not (shard_path / ".success").is_file():
+            raise FileNotFoundError(f"Packed WildChat cache shard is missing its success marker: {shard_path}.")
+        for field in ("assistant_masks", "input_ids"):
+            field_path = shard_path / field
+            has_payload = field_path.is_dir() and any(
+                path.is_file() and path.stat().st_size > 0 for path in field_path.rglob("*")
+            )
+            if not has_payload:
+                raise FileNotFoundError(f"Packed WildChat cache shard has no {field} payload: {shard_path}.")
+
+    return SNOWBALL_CHAT_TOKENS, SNOWBALL_CHAT_EXAMPLES, len(typed_finished_shards)
+
+
+def _validate_tokenizer(tokenizer_path: str) -> int:
+    path = Path(tokenizer_path)
+    if not path.is_absolute():
+        raise ValueError(f"Snowball tokenizer path must be absolute: {tokenizer_path!r}.")
+    for filename in ("tokenizer.json", "tokenizer_config.json"):
+        if not (path / filename).is_file():
+            raise FileNotFoundError(f"Snowball tokenizer is missing {path / filename}.")
+
+    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    vocab_size = len(tokenizer)
+    if vocab_size != SNOWBALL_CHAT_MODEL_CONFIG.vocab_size:
+        raise ValueError(
+            f"Snowball tokenizer has {vocab_size} tokens, but the model expects {SNOWBALL_CHAT_MODEL_CONFIG.vocab_size}."
+        )
+    token_ids = tokenizer.encode("Snowball launch preflight", add_special_tokens=False)
+    if not token_ids or max(token_ids) >= vocab_size:
+        raise ValueError(f"Snowball tokenizer produced invalid token IDs: {token_ids!r}.")
+    return vocab_size
+
+
+def _validate_output_path(
+    output_path: str,
+    *,
+    input_paths: tuple[str, ...],
+    expected_output_checkpoint_step: int | None,
+) -> tuple[str | None, int, int]:
+    path = Path(output_path)
+    if not path.is_absolute():
+        raise ValueError(f"Snowball output path must be absolute: {output_path!r}.")
+    resolved_output = path.resolve(strict=False)
+    for input_path in input_paths:
+        resolved_input = Path(input_path).resolve(strict=True)
+        if (
+            resolved_output == resolved_input
+            or resolved_output in resolved_input.parents
+            or resolved_input in resolved_output.parents
+        ):
+            raise ValueError(f"Snowball output path {resolved_output} overlaps input path {resolved_input}.")
+
+    if not path.parent.is_dir() or not os.access(path.parent, os.W_OK | os.X_OK):
+        raise PermissionError(f"Snowball output parent is not writable: {path.parent}.")
+    free_bytes = shutil.disk_usage(path.parent).free
+    stat = os.statvfs(path.parent)
+    free_inodes = stat.f_favail
+    if free_bytes < _MINIMUM_OUTPUT_FREE_BYTES:
+        raise OSError(
+            f"Snowball output filesystem has only {free_bytes} free bytes; "
+            f"at least {_MINIMUM_OUTPUT_FREE_BYTES} are required."
+        )
+    if free_inodes < _MINIMUM_OUTPUT_FREE_INODES:
+        raise OSError(
+            f"Snowball output filesystem has only {free_inodes} free inodes; "
+            f"at least {_MINIMUM_OUTPUT_FREE_INODES} are required."
+        )
+
+    if expected_output_checkpoint_step is None:
+        if path.exists():
+            raise FileExistsError(f"Fresh Snowball output path already exists: {path}.")
+        return None, free_bytes, free_inodes
+
+    output_checkpoint = latest_checkpoint_path(path / "checkpoints")
+    output_checkpoint_path = Path(output_checkpoint)
+    output_metadata = _json_object(output_checkpoint_path / "metadata.json")
+    if output_metadata.get("step") != expected_output_checkpoint_step:
+        raise ValueError(
+            f"Snowball resume expected output checkpoint step {expected_output_checkpoint_step}, got "
+            f"{output_metadata.get('step')!r} at {output_checkpoint}."
+        )
+    if not (output_checkpoint_path / "manifest.ocdbt").is_file():
+        raise FileNotFoundError(f"Snowball resume checkpoint is missing manifest.ocdbt: {output_checkpoint}.")
+    output_payload_files = [path for path in (output_checkpoint_path / "d").rglob("*") if path.is_file()]
+    if not output_payload_files or sum(path.stat().st_size for path in output_payload_files) == 0:
+        raise ValueError(f"Snowball resume checkpoint has no payload data: {output_checkpoint}.")
+    return output_checkpoint, free_bytes, free_inodes
+
+
+def preflight_snowball_chat(
+    *,
+    init_checkpoint_path: str,
+    data_cache_path: str,
+    tokenizer_path: str,
+    output_path: str,
+    run_id: str,
+    steps: int,
+    devices: int,
+    expected_output_checkpoint_step: int | None = None,
+) -> SnowballChatPreflight:
+    """Validate every static input before requesting a 64-node training allocation."""
+    if not run_id or "/" in run_id:
+        raise ValueError(f"Snowball run ID must be a non-empty path-free name, got {run_id!r}.")
+    if steps < 1 or steps > SNOWBALL_CHAT_STEPS:
+        raise ValueError(f"Snowball steps must be between 1 and {SNOWBALL_CHAT_STEPS}, got {steps}.")
+    if expected_output_checkpoint_step is not None and steps <= expected_output_checkpoint_step:
+        raise ValueError(
+            f"Snowball resume target {steps} must exceed checkpoint step {expected_output_checkpoint_step}."
+        )
+
+    resolved_init, payload_files, payload_bytes = validate_native_checkpoint_layout(init_checkpoint_path)
+    cache_tokens, cache_examples, cache_shards = validate_chat_cache_layout(data_cache_path)
+    tokenizer_vocab_size = _validate_tokenizer(tokenizer_path)
+
+    mesh_factor = SNOWBALL_CHAT_REPLICA_AXIS * SNOWBALL_CHAT_EXPERT_PARALLEL * SNOWBALL_CHAT_MODEL_AXIS
+    if devices % mesh_factor != 0:
+        raise ValueError(f"Snowball device count {devices} is not divisible by mesh factor {mesh_factor}.")
+    data_axis_size = devices // mesh_factor
+    batch_shards = data_axis_size * SNOWBALL_CHAT_EXPERT_PARALLEL
+    if SNOWBALL_CHAT_BATCH_SIZE % batch_shards != 0:
+        raise ValueError(f"Snowball batch size {SNOWBALL_CHAT_BATCH_SIZE} is not divisible by {batch_shards} shards.")
+    ici_axes, dcn_axes = vista_trainer_mesh_config().axis_shapes(num_devices=devices, num_slices=devices)
+    if ici_axes != {"data": 1, "replica": 1, "model": 1, "expert": 1} or dcn_axes != {"replica_dcn": devices}:
+        raise ValueError(f"Snowball Vista trainer mesh is invalid: ICI={ici_axes}, DCN={dcn_axes}.")
+
+    output_checkpoint, output_free_bytes, output_free_inodes = _validate_output_path(
+        output_path,
+        input_paths=(resolved_init, data_cache_path, tokenizer_path),
+        expected_output_checkpoint_step=expected_output_checkpoint_step,
+    )
+    run_config = snowball_chat_run_config(
+        init_checkpoint_path=resolved_init,
+        data_cache_path=data_cache_path,
+        tokenizer_path=tokenizer_path,
+        output_path=output_path,
+        run_id=run_id,
+        steps=steps,
+        devices=devices,
+    )
+    if run_config.trainer.trainer.initialize_from != resolved_init:
+        raise ValueError(
+            f"Snowball config resolved init checkpoint to {run_config.trainer.trainer.initialize_from}, "
+            f"expected {resolved_init}."
+        )
+
+    return SnowballChatPreflight(
+        init_checkpoint_path=resolved_init,
+        init_payload_files=payload_files,
+        init_payload_bytes=payload_bytes,
+        cache_tokens=cache_tokens,
+        cache_examples=cache_examples,
+        cache_shards=cache_shards,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        data_axis_size=data_axis_size,
+        per_device_batch_size=SNOWBALL_CHAT_BATCH_SIZE // batch_shards,
+        output_free_bytes=output_free_bytes,
+        output_free_inodes=output_free_inodes,
+        output_checkpoint_path=output_checkpoint,
+    )
 
 
 def snowball_chat_data_config(*, cache_path: str, tokenizer_path: str) -> LmDataConfig:
@@ -259,6 +525,39 @@ def distributed_probe_command(expected_devices: int) -> None:
     run_distributed_probe(expected_devices)
 
 
+@main.command("preflight")
+@click.option("--init-checkpoint-path", required=True)
+@click.option("--data-cache-path", required=True)
+@click.option("--tokenizer-path", required=True)
+@click.option("--output-path", required=True)
+@click.option("--run-id", required=True)
+@click.option("--steps", type=click.IntRange(min=1), default=SNOWBALL_CHAT_STEPS, show_default=True)
+@click.option("--devices", type=click.IntRange(min=1), default=SNOWBALL_CHAT_DEVICES, show_default=True)
+@click.option("--expected-output-checkpoint-step", type=click.IntRange(min=0))
+def preflight_command(
+    init_checkpoint_path: str,
+    data_cache_path: str,
+    tokenizer_path: str,
+    output_path: str,
+    run_id: str,
+    steps: int,
+    devices: int,
+    expected_output_checkpoint_step: int | None,
+) -> None:
+    report = preflight_snowball_chat(
+        init_checkpoint_path=init_checkpoint_path,
+        data_cache_path=data_cache_path,
+        tokenizer_path=tokenizer_path,
+        output_path=output_path,
+        run_id=run_id,
+        steps=steps,
+        devices=devices,
+        expected_output_checkpoint_step=expected_output_checkpoint_step,
+    )
+    click.echo(json.dumps(dataclasses.asdict(report), sort_keys=True))
+    click.echo("SNOWBALL_CHAT_PREFLIGHT_OK")
+
+
 @main.command("train")
 @click.option("--init-checkpoint-path", required=True)
 @click.option("--data-cache-path", required=True)
@@ -267,6 +566,7 @@ def distributed_probe_command(expected_devices: int) -> None:
 @click.option("--run-id", required=True)
 @click.option("--steps", type=click.IntRange(min=1), default=SNOWBALL_CHAT_STEPS, show_default=True)
 @click.option("--devices", type=click.IntRange(min=1), default=SNOWBALL_CHAT_DEVICES, show_default=True)
+@click.option("--expected-output-checkpoint-step", type=click.IntRange(min=0))
 def train_command(
     init_checkpoint_path: str,
     data_cache_path: str,
@@ -275,7 +575,18 @@ def train_command(
     run_id: str,
     steps: int,
     devices: int,
+    expected_output_checkpoint_step: int | None,
 ) -> None:
+    preflight_snowball_chat(
+        init_checkpoint_path=init_checkpoint_path,
+        data_cache_path=data_cache_path,
+        tokenizer_path=tokenizer_path,
+        output_path=output_path,
+        run_id=run_id,
+        steps=steps,
+        devices=devices,
+        expected_output_checkpoint_step=expected_output_checkpoint_step,
+    )
     run_config = snowball_chat_run_config(
         init_checkpoint_path=init_checkpoint_path,
         data_cache_path=data_cache_path,

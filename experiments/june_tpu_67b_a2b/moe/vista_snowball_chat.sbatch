@@ -66,15 +66,22 @@ elif [[ "${SNOWBALL_MODE}" == "train" ]]; then
   : "${SNOWBALL_OUTPUT:?Set SNOWBALL_OUTPUT to a unique training output directory.}"
   : "${SNOWBALL_RUN_ID:?Set SNOWBALL_RUN_ID to a unique run name.}"
   : "${SNOWBALL_STEPS:?Set SNOWBALL_STEPS to 2 for smoke or 257 for Chat.}"
+  preflight_args=(
+    --init-checkpoint-path "${SNOWBALL_INIT}"
+    --data-cache-path "${SNOWBALL_CACHE}"
+    --tokenizer-path "${SNOWBALL_TOKENIZER}"
+    --output-path "${SNOWBALL_OUTPUT}"
+    --run-id "${SNOWBALL_RUN_ID}"
+    --steps "${SNOWBALL_STEPS}"
+    --devices "${SLURM_NTASKS}"
+  )
+  if [[ -n "${SNOWBALL_EXPECT_OUTPUT_CHECKPOINT_STEP:-}" ]]; then
+    preflight_args+=(--expected-output-checkpoint-step "${SNOWBALL_EXPECT_OUTPUT_CHECKPOINT_STEP}")
+  fi
+  "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat preflight "${preflight_args[@]}"
   srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
     "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat train \
-      --init-checkpoint-path "${SNOWBALL_INIT}" \
-      --data-cache-path "${SNOWBALL_CACHE}" \
-      --tokenizer-path "${SNOWBALL_TOKENIZER}" \
-      --output-path "${SNOWBALL_OUTPUT}" \
-      --run-id "${SNOWBALL_RUN_ID}" \
-      --steps "${SNOWBALL_STEPS}" \
-      --devices "${SLURM_NTASKS}"
+      "${preflight_args[@]}"
 else
   echo "FATAL: SNOWBALL_MODE must be distributed-probe, import, or train; got ${SNOWBALL_MODE}." >&2
   exit 2
