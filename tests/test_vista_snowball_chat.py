@@ -20,6 +20,7 @@ from experiments.june_tpu_67b_a2b.moe.vista_snowball_chat import (
     expected_chat_steps,
     snowball_chat_format,
     validate_chat_epoch,
+    vista_trainer_mesh_config,
 )
 from experiments.sft.delphi_chat_template import DELPHI_V0_CHAT_TEMPLATE
 
@@ -63,3 +64,12 @@ def test_epoch_step_count_uses_packed_token_count() -> None:
 def test_epoch_gate_rejects_cache_drift() -> None:
     with pytest.raises(ValueError, match="requires 257"):
         validate_chat_epoch(536_000_000)
+
+
+def test_vista_trainer_mesh_accepts_one_device_per_node() -> None:
+    mesh = vista_trainer_mesh_config()
+
+    ici_axes, dcn_axes = mesh.axis_shapes(num_devices=64, num_slices=64)
+
+    assert ici_axes == {"data": 1, "replica": 1, "model": 1, "expert": 1}
+    assert dcn_axes == {"replica_dcn": 64}

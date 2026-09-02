@@ -126,6 +126,21 @@ def validate_chat_epoch(total_tokens: int) -> int:
     return steps
 
 
+def vista_trainer_mesh_config() -> MeshConfig:
+    """Return Trainer bookkeeping for Vista's one-GPU-per-node topology.
+
+    Grug constructs its compute mesh separately as ``(replica_dcn, data, expert,
+    model) = (1, 8, 8, 1)``.  TrainerConfig only needs a compatible 64-way batch
+    mesh to derive per-device parallelism before the Grug mesh exists.  On Vista,
+    every Slurm rank is a one-device JAX slice, so the local ICI expert axis must
+    remain size one and the 64 ranks are represented by ``replica_dcn``.
+    """
+    return MeshConfig(
+        axes={"expert": 1},
+        compute_mapping={"batch": ["replica_dcn", "data", "expert"]},
+    )
+
+
 def run_distributed_probe(expected_devices: int) -> None:
     """Initialize JAX from Slurm and verify a cross-process collective."""
     import jax  # noqa: PLC0415
@@ -184,7 +199,7 @@ def snowball_chat_run_config(
             mode="offline",
         ),
         use_explicit_mesh_axes=True,
-        mesh=MeshConfig(axes={"expert": SNOWBALL_CHAT_EXPERT_PARALLEL}),
+        mesh=vista_trainer_mesh_config(),
         require_accelerator=True,
         allow_nondivisible_batch_size=False,
         checkpointer=CheckpointerConfig(
