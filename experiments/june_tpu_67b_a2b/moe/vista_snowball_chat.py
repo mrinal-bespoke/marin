@@ -433,13 +433,16 @@ def run_distributed_probe(expected_devices: int) -> None:
 
 
 def run_gpu_kernel_probe() -> None:
-    """Compile and execute the production attention forward and backward on one GH200."""
+    """Validate training backends and execute the production attention kernels on one GH200."""
     import jax  # noqa: PLC0415
     import jax.numpy as jnp  # noqa: PLC0415
     from levanter.grug.attention import AttentionMask, gpu_fa4_cute_attention  # noqa: PLC0415
 
     if jax.default_backend() != "gpu":
         raise RuntimeError(f"Snowball GPU kernel probe requires a GPU backend, got {jax.default_backend()!r}.")
+    cpu_devices = jax.local_devices(backend="cpu")
+    if len(cpu_devices) != 1:
+        raise RuntimeError(f"Snowball data loading requires one local CPU device, found {len(cpu_devices)}.")
 
     key = jax.random.PRNGKey(SNOWBALL_CHAT_SEED)
     q_key, k_key, v_key = jax.random.split(key, 3)
@@ -461,6 +464,7 @@ def run_gpu_kernel_probe() -> None:
 
     click.echo(f"backend={jax.default_backend()}")
     click.echo(f"device={jax.devices()[0]}")
+    click.echo(f"cpu_device={cpu_devices[0]}")
     click.echo("SNOWBALL_GPU_KERNEL_PROBE_OK")
 
 

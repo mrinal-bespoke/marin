@@ -23,7 +23,7 @@ module load gcc/13.2.0 cuda/12.8
 
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
-export JAX_PLATFORMS=cuda
+export JAX_PLATFORMS=cuda,cpu
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 export TOKENIZERS_PARALLELISM=false
