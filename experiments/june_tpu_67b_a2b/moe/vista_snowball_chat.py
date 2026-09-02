@@ -432,6 +432,38 @@ def run_distributed_probe(expected_devices: int) -> None:
         click.echo("SNOWBALL_DISTRIBUTED_PROBE_OK")
 
 
+def run_gpu_kernel_probe() -> None:
+    """Compile and execute the production attention forward and backward on one GH200."""
+    import jax  # noqa: PLC0415
+    import jax.numpy as jnp  # noqa: PLC0415
+    from levanter.grug.attention import AttentionMask, gpu_fa4_cute_attention  # noqa: PLC0415
+
+    if jax.default_backend() != "gpu":
+        raise RuntimeError(f"Snowball GPU kernel probe requires a GPU backend, got {jax.default_backend()!r}.")
+
+    key = jax.random.PRNGKey(SNOWBALL_CHAT_SEED)
+    q_key, k_key, v_key = jax.random.split(key, 3)
+    q = jax.random.normal(q_key, (1, 128, 20, 128), dtype=jnp.bfloat16) * 0.1
+    k = jax.random.normal(k_key, (1, 128, 5, 128), dtype=jnp.bfloat16) * 0.1
+    v = jax.random.normal(v_key, (1, 128, 5, 128), dtype=jnp.bfloat16) * 0.1
+    mask = AttentionMask.causal(sliding_window=31)
+
+    @jax.jit
+    def loss_and_output(q_value, k_value, v_value):
+        output = gpu_fa4_cute_attention(q_value, k_value, v_value, mask)
+        return jnp.sum(output.astype(jnp.float32)), output
+
+    (_, output), gradients = jax.value_and_grad(loss_and_output, argnums=(0, 1, 2), has_aux=True)(q, k, v)
+    jax.block_until_ready((output, gradients))
+    arrays = (output, *gradients)
+    if not all(bool(jax.device_get(jnp.all(jnp.isfinite(array)))) for array in arrays):
+        raise ValueError("Snowball FA4 forward or backward produced non-finite values.")
+
+    click.echo(f"backend={jax.default_backend()}")
+    click.echo(f"device={jax.devices()[0]}")
+    click.echo("SNOWBALL_GPU_KERNEL_PROBE_OK")
+
+
 def snowball_chat_run_config(
     *,
     init_checkpoint_path: str,
@@ -523,6 +555,11 @@ def prepare_data_command(parquet_glob: str, cache_path: str, tokenizer_path: str
 @click.option("--expected-devices", type=click.IntRange(min=2), required=True)
 def distributed_probe_command(expected_devices: int) -> None:
     run_distributed_probe(expected_devices)
+
+
+@main.command("gpu-kernel-probe")
+def gpu_kernel_probe_command() -> None:
+    run_gpu_kernel_probe()
 
 
 @main.command("preflight")
