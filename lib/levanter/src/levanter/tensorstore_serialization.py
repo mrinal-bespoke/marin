@@ -9,6 +9,7 @@ import itertools
 import logging
 import math
 import os
+import socket
 import urllib.parse
 import zlib
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import tensorstore as ts
+from jax.experimental import multihost_utils
 from jax.experimental.array_serialization import tensorstore_impl as ts_impl
 from haliax.jax_utils import is_jax_array_like
 from haliax.partitioning import ResourceMapping
@@ -48,6 +50,7 @@ _HOST_MEMORY_KIND = "pinned_host"
 _DEFAULT_STAGED_CHUNKS = 32
 # Host memory a staged byte occupies while its write is in flight, for reporting only.
 _STAGED_BYTE_OVERHEAD = 4
+_ACTIVE_OCDBT_COORDINATORS: dict[str, object] = {}
 
 
 def _format_gib(num_bytes: int) -> str:
@@ -460,14 +463,36 @@ async def _list_ocdbt_keys(checkpoint_root: str) -> list[str]:
     return [key.decode("utf-8") for key in keys_bytes]
 
 
-async def _initialize_ocdbt(checkpoint_root: str) -> None:
+def _distributed_ocdbt_context(checkpoint_root: str) -> ts.Context:
+    """Start one OCDBT coordinator and return a context connected to it on every rank."""
+    if jax.process_count() == 1:
+        return ts.Context(ts_impl._TS_CONTEXT.spec)
+
+    address_bytes = np.zeros(512, dtype=np.uint8)
+    if jax.process_index() == 0:
+        server = ts.ocdbt.DistributedCoordinatorServer()
+        address = f"{socket.gethostname()}:{server.port}".encode()
+        if len(address) > address_bytes.size:
+            raise ValueError(f"OCDBT coordinator address is too long: {address!r}")
+        address_bytes[: len(address)] = np.frombuffer(address, dtype=np.uint8)
+        _ACTIVE_OCDBT_COORDINATORS[checkpoint_root] = server
+
+    address_bytes = np.asarray(multihost_utils.broadcast_one_to_all(address_bytes))
+    address = address_bytes.tobytes().rstrip(b"\0").decode()
+    if not address:
+        raise RuntimeError("OCDBT coordinator address broadcast was empty")
+    return ts.Context({"ocdbt_coordinator": {"address": address}}, parent=ts_impl._TS_CONTEXT)
+
+
+async def _initialize_ocdbt(checkpoint_root: str, context: ts.Context) -> None:
     """Create the numbered OCDBT database before distributed writers open arrays."""
     kvstore = await ts.KvStore.open(
         {
             "driver": KVSTORE_DRIVER,
             "base": build_kvstore_spec(checkpoint_root),
             "config": {"manifest_kind": "numbered"},
-        }
+        },
+        context=context,
     )
     await kvstore.write(b".checkpoint_init", b"")
 
@@ -572,6 +597,14 @@ def tree_serialize_leaves_tensorstore(
     if commit_callback is None:
         commit_callback = lambda: logger.info("Committed checkpoint to Tensorstore")  # noqa
 
+    user_commit_callback = commit_callback
+
+    def commit_callback():
+        try:
+            user_commit_callback()
+        finally:
+            _ACTIVE_OCDBT_COORDINATORS.pop(str(checkpoint_dir), None)
+
     if debug_checkpointer:
         logger.info(
             "Checkpoint tensorstore serialize start: dir=%s arrays=%d total=%s largest=%s (%s)",
@@ -596,11 +629,12 @@ def tree_serialize_leaves_tensorstore(
     ]
     tspecs = [_create_ocdbt_spec(checkpoint_dir, entry.path, entry=entry) for entry in entries]
 
+    context = _distributed_ocdbt_context(str(checkpoint_dir))
     if jax.process_index() == 0:
         write_manifest(
             checkpoint_dir, build_manifest(entries, array_driver=ARRAY_DRIVER, kvstore_driver=KVSTORE_DRIVER)
         )
-        asyncio.run(_initialize_ocdbt(checkpoint_dir))
+        asyncio.run(_initialize_ocdbt(checkpoint_dir, context))
 
     # The numbered database still has one immutable configuration manifest. Ensure rank 0
     # creates it before any other rank opens an array, then all commits use distinct files.
@@ -620,7 +654,7 @@ def tree_serialize_leaves_tensorstore(
         )
         flush_debug_output(logger)
 
-    _serialize_arrays(arrays, tspecs, plans, manager, write_config, commit_callback)
+    _serialize_arrays(arrays, tspecs, plans, manager, write_config, commit_callback, context)
 
     if debug_checkpointer:
         logger.info("Checkpoint tensorstore serialize handed off async commit for %s", checkpoint_dir)
@@ -637,6 +671,7 @@ def _serialize_arrays(
     manager: array_ser.GlobalAsyncCheckpointManager,
     config: TensorStoreWriteConfig,
     commit_callback: Callable,
+    context: ts.Context,
 ) -> None:
     """Write every array according to its plan and start the asynchronous commit.
 
@@ -645,9 +680,6 @@ def _serialize_arrays(
     """
     manager.wait_until_finished()
 
-    # JAX's process-lifetime ts.Context accumulates caches across saves, since each save
-    # writes a new OCDBT database (#6785). Cloning the spec keeps its pools and limits.
-    context = ts.Context(ts_impl._TS_CONTEXT.spec)
     gate = _HostStagingGate(config.max_staged_host_bytes)
     commit_futures: list[ts.Future] = []
 
