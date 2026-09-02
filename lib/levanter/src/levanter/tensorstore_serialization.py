@@ -715,8 +715,10 @@ def _serialize_arrays(
 
             async def stage(region=region):
                 data = await _transfer_shard_to_pageable_host(shard, region.local_index)
-                # The snapshot is private and never mutated, so TensorStore may hold the reference.
-                return store[region.index].write(data, can_reference_source_data_indefinitely=True)
+                # ``data`` is an ephemeral staging buffer. Force TensorStore to copy it before
+                # ``write.copy`` resolves; otherwise large asynchronous encodes may outlive the
+                # Python array and observe allocator-reused memory.
+                return store[region.index].write(data, can_reference_source_data_indefinitely=False)
 
             await issue_write(num_bytes, stage)
 
