@@ -10,7 +10,9 @@
 # Run with SNOWBALL_MODE=runtime-probe on one GH200 to validate GPU kernels and
 # the real cache read, SNOWBALL_MODE=distributed-probe and `sbatch --nodes=8`
 # for the multi-node fabric gate, or SNOWBALL_MODE=import and `sbatch --nodes=32`
-# for the memory-sharded HF-to-native conversion. The default mode launches Chat.
+# for the memory-sharded HF-to-native conversion. SNOWBALL_MODE=train-chain runs
+# smoke, fresh-process resume, and production without releasing the allocation.
+# The default mode launches one Chat stage.
 
 set -euo pipefail
 
@@ -45,6 +47,30 @@ export PYTHONPATH="${MARIN_ROOT}:${MARIN_ROOT}/lib/levanter/src:${MARIN_ROOT}/li
 test -x "${MARIN_PYTHON}"
 cd "${MARIN_ROOT}"
 
+run_train() {
+  local init_checkpoint_path="$1"
+  local output_path="$2"
+  local run_id="$3"
+  local steps="$4"
+  local expected_output_checkpoint_step="${5:-}"
+  local -a preflight_args=(
+    --init-checkpoint-path "${init_checkpoint_path}"
+    --data-cache-path "${SNOWBALL_CACHE}"
+    --tokenizer-path "${SNOWBALL_TOKENIZER}"
+    --output-path "${output_path}"
+    --run-id "${run_id}"
+    --steps "${steps}"
+    --devices "${SLURM_NTASKS}"
+  )
+  if [[ -n "${expected_output_checkpoint_step}" ]]; then
+    preflight_args+=(--expected-output-checkpoint-step "${expected_output_checkpoint_step}")
+  fi
+  "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat preflight "${preflight_args[@]}"
+  srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
+    "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat train \
+      "${preflight_args[@]}"
+}
+
 if [[ "${SNOWBALL_MODE}" == "runtime-probe" ]]; then
   : "${SNOWBALL_CACHE:?Set SNOWBALL_CACHE to the packed WildChat cache.}"
   : "${SNOWBALL_TOKENIZER:?Set SNOWBALL_TOKENIZER to the pinned tokenizer directory.}"
@@ -74,23 +100,28 @@ elif [[ "${SNOWBALL_MODE}" == "train" ]]; then
   : "${SNOWBALL_OUTPUT:?Set SNOWBALL_OUTPUT to a unique training output directory.}"
   : "${SNOWBALL_RUN_ID:?Set SNOWBALL_RUN_ID to a unique run name.}"
   : "${SNOWBALL_STEPS:?Set SNOWBALL_STEPS to 2 for smoke or 257 for Chat.}"
-  preflight_args=(
-    --init-checkpoint-path "${SNOWBALL_INIT}"
-    --data-cache-path "${SNOWBALL_CACHE}"
-    --tokenizer-path "${SNOWBALL_TOKENIZER}"
-    --output-path "${SNOWBALL_OUTPUT}"
-    --run-id "${SNOWBALL_RUN_ID}"
-    --steps "${SNOWBALL_STEPS}"
-    --devices "${SLURM_NTASKS}"
-  )
-  if [[ -n "${SNOWBALL_EXPECT_OUTPUT_CHECKPOINT_STEP:-}" ]]; then
-    preflight_args+=(--expected-output-checkpoint-step "${SNOWBALL_EXPECT_OUTPUT_CHECKPOINT_STEP}")
+  run_train \
+    "${SNOWBALL_INIT}" \
+    "${SNOWBALL_OUTPUT}" \
+    "${SNOWBALL_RUN_ID}" \
+    "${SNOWBALL_STEPS}" \
+    "${SNOWBALL_EXPECT_OUTPUT_CHECKPOINT_STEP:-}"
+elif [[ "${SNOWBALL_MODE}" == "train-chain" ]]; then
+  : "${SNOWBALL_INIT:?Set SNOWBALL_INIT to the native weights-only checkpoint root.}"
+  : "${SNOWBALL_CACHE:?Set SNOWBALL_CACHE to the packed WildChat cache.}"
+  : "${SNOWBALL_TOKENIZER:?Set SNOWBALL_TOKENIZER to the pinned tokenizer directory.}"
+  : "${SNOWBALL_SMOKE_OUTPUT:?Set SNOWBALL_SMOKE_OUTPUT to a fresh smoke output directory.}"
+  : "${SNOWBALL_SMOKE_RUN_ID:?Set SNOWBALL_SMOKE_RUN_ID to a unique smoke run name.}"
+  : "${SNOWBALL_OUTPUT:?Set SNOWBALL_OUTPUT to a fresh production output directory.}"
+  : "${SNOWBALL_RUN_ID:?Set SNOWBALL_RUN_ID to a unique production run name.}"
+  if [[ "${SNOWBALL_SMOKE_OUTPUT}" == "${SNOWBALL_OUTPUT}" ]]; then
+    echo "FATAL: smoke and production outputs must be different." >&2
+    exit 2
   fi
-  "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat preflight "${preflight_args[@]}"
-  srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
-    "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat train \
-      "${preflight_args[@]}"
+  run_train "${SNOWBALL_INIT}" "${SNOWBALL_SMOKE_OUTPUT}" "${SNOWBALL_SMOKE_RUN_ID}" 2
+  run_train "${SNOWBALL_INIT}" "${SNOWBALL_SMOKE_OUTPUT}" "${SNOWBALL_SMOKE_RUN_ID}" 3 2
+  run_train "${SNOWBALL_INIT}" "${SNOWBALL_OUTPUT}" "${SNOWBALL_RUN_ID}" 257
 else
-  echo "FATAL: SNOWBALL_MODE must be runtime-probe, distributed-probe, import, or train; got ${SNOWBALL_MODE}." >&2
+  echo "FATAL: SNOWBALL_MODE must be runtime-probe, distributed-probe, import, train, or train-chain; got ${SNOWBALL_MODE}." >&2
   exit 2
 fi
