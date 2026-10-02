@@ -49,3 +49,12 @@ SNOWBALL_CHAT_OPTIMIZER = GrugMoeAdamHConfig(
     warmup=0.03,
     lr_schedule="cosine",
 )
+
+# The agentic/Nemotron stages in the reference recipe use a ten-times lower
+# learning rate. Keep this separate from the Chat/Thinking optimizer so a new
+# stage cannot silently inherit the Stage-1 schedule.
+SNOWBALL_AGENTIC_OPTIMIZER = dataclasses.replace(
+    SNOWBALL_CHAT_OPTIMIZER,
+    learning_rate=5e-6,
+    adam_lr=5e-6,
+)

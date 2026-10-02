@@ -1,3 +1,6 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import math
 import os
@@ -25,9 +28,7 @@ from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
 # Delphi V0 at serve/eval time.
 CHECKPOINT = os.environ.get(
     "SNOWBALL_EXPORT_CHECKPOINT",
-    "s3://marin-us-east-02a/marin/grug/"
-    "snowball_step105149_sft_s2_thinking/"
-    "2026.08.13.1/checkpoints/step-630/",
+    "s3://marin-us-east-02a/marin/grug/" "snowball_step105149_sft_s2_thinking/" "2026.08.13.1/checkpoints/step-630/",
 )
 OUTPUT = os.environ.get(
     "SNOWBALL_EXPORT_OUTPUT",
@@ -68,8 +69,7 @@ if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
     from levanter.distributed import DistributedConfig
 
     DistributedConfig().initialize()
-    print(f"EXPORT distributed: {jax.process_count()} processes, "
-          f"{jax.device_count()} global devices", flush=True)
+    print(f"EXPORT distributed: {jax.process_count()} processes, " f"{jax.device_count()} global devices", flush=True)
 
 mesh = compact_grug_mesh(
     expert_axis_size=EXPERT_AXIS,
@@ -117,7 +117,9 @@ with set_mesh(mesh):
         config=main_config,
     )
     tokenizer = load_tokenizer(TOKENIZER)
-    converter = main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16"})
+    converter = (
+        main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16"})
+    )
     converter.save_pretrained(
         export_model,
         OUTPUT,

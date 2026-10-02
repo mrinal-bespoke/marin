@@ -110,6 +110,7 @@ def test_checkpointer_config_sets_manager_timeout(tmp_path):
 
     manager.assert_called_once_with(timeout_secs=7200)
 
+
 def test_checkpointer_temporal_policy():
     fake_now = datetime.datetime(2021, 1, 1, 0, 0, 0)
 
@@ -748,9 +749,7 @@ def test_load_from_checkpoint_or_initialize():
         filtered = eqx.filter(model0, is_checkpointed)
         save_checkpoint(filtered, step=0, checkpoint_path=tmpdir)
 
-        loaded = load_checkpoint_or_initialize(init_fn, [tmpdir], is_checkpointed=is_checkpointed, donate_args=False)(
-            k1
-        )
+        loaded = load_checkpoint_or_initialize(init_fn, [tmpdir], is_checkpointed=is_checkpointed, donate_args=False)(k1)
         assert not any(jax.tree_util.tree_leaves(eqx.filter(loaded, lambda x: isinstance(x, ShapeDtypeStruct))))
 
         latest_checkpoint = discover_latest_checkpoint(tmpdir)
@@ -836,9 +835,9 @@ def test_load_from_checkpoint_or_initialize_works_if_file_not_found():
         is_checkpointed = jtu.tree_map(lambda _: False, model0)
         is_checkpointed = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed, replace=True)
 
-        loaded = load_checkpoint_or_initialize(
-            init_fn, ["kanmfklafnmjlkanfjklanfjkh"], is_checkpointed=is_checkpointed
-        )(k1)
+        loaded = load_checkpoint_or_initialize(init_fn, ["kanmfklafnmjlkanfjklanfjkh"], is_checkpointed=is_checkpointed)(
+            k1
+        )
 
         assert not any(jax.tree_util.tree_leaves(eqx.filter(loaded, lambda x: isinstance(x, ShapeDtypeStruct))))
         # should be the same as model1

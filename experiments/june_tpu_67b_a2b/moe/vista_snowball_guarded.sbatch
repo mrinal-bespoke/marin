@@ -3,21 +3,19 @@
 # Stage-agnostic: SNOWBALL_STEPS selects the epoch length (Chat 257; Thinking is
 # DERIVED from its completed cache, never hardcoded).
 #
-# NOT a six-step test. Issue #7344 reports the hazard tracks WALL CLOCK, with
-# observed sit-times of 2296-15710s, so a low step budget can finish before ever
-# encountering the bug. Steps 1-6 are an observation gate only; the run continues
-# to 257 in the same allocation.
+# NOT a six-step test. Issue #7344 reports the hazard tracks WALL CLOCK, so a low
+# step budget can finish before encountering it. The run always continues to the
+# requested stage budget in the same allocation.
 #
-# NCCL is the 2.30.7 override (marin fix branch 25f8cbaf3). CONTROLLED EXPERIMENT,
-# NOT a known fix: #7344's own ablation lists 2.28.9 -> 2.30.7 as still wedging, so
-# a second mechanism is suspected, and fabric/topology remains an open hypothesis.
+# NCCL 2.30.7 completed both the 257-step Chat run and the 630-step Thinking run
+# on Vista. The runner pins that build and records the mapped library for every
+# new run rather than assuming the environment resolved it correctly.
 #SBATCH --partition=gh
 #SBATCH --nodes=64
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --time=2-00:00:00
 #SBATCH --job-name=snowball-guarded
-#SBATCH --exclude=c610-021,c611-011,c640-041,c611-041,c611-122,c637-082,c636-121,c635-101,c641-061,c611-051,c636-152,c608-042,c634-142,c641-012,c634-052,c621-102,c637-042,c638-101,c638-102,c638-112
 
 set -uo pipefail
 : "${MARIN_ROOT:?}"; : "${MARIN_PYTHON:?}"
@@ -39,6 +37,11 @@ export CUDA_HOME="${TACC_CUDA_DIR}"
 export TRITON_CC="$(command -v gcc)"; export CC="${TRITON_CC}"; export CXX="$(command -v g++)"
 export LD_PRELOAD="$(gcc -print-file-name=libstdc++.so.6)"
 S_SCRATCH="${SCRATCH:-$(dirname "${MARIN_ROOT}")}"
+
+# Put the validated wheel ahead of Vista's system NCCL before JAX starts. Merely
+# finding 2.30.7 in the venv is insufficient if the dynamic loader maps 2.28.9.
+NCCL_LIBRARY=$("${MARIN_PYTHON}" -c 'import glob, os, sys; print(sorted(glob.glob(os.path.join(sys.prefix, "**", "libnccl.so.2"), recursive=True))[0])')
+export LD_LIBRARY_PATH="$(dirname "${NCCL_LIBRARY}"):${LD_LIBRARY_PATH:-}"
 
 # Command buffers stay off: independently established (took the smoke stage from
 # no-checkpoint-in-7h to a verified step-2 checkpoint).
@@ -82,6 +85,11 @@ RUNLOG="${FORENSICS}/run.log"
 : > "${RUNLOG}"
 echo "GUARDED_RUN python=${MARIN_PYTHON} stage=${SNOWBALL_STAGE} steps=${SNOWBALL_STEPS} stall_seconds=${STALL_SECONDS}"
 echo "GUARDED_RUN runlog=${RUNLOG} forensics=${FORENSICS}"
+
+# Fail before JAX initializes if a fresh environment silently resolved the
+# affected 2.28.9 build. The successful Vista runs used exactly 2.30.7.
+"${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat verify-nccl \
+  --expected 2.30.7 || exit 3
 
 # Vista sets kernel.yama.ptrace_scope=2, so gdb/eu-stack CANNOT attach even to a
 # child (verified: job 966900). The symbolized C stacks in the #7344 workflow are
@@ -192,7 +200,7 @@ trap 'kill ${WATCHDOG_PID} 2>/dev/null' EXIT
   --run-id "${SNOWBALL_RUN_ID}" --steps "${SNOWBALL_STEPS}" --devices "${SLURM_NTASKS}" \
   --stage "${SNOWBALL_STAGE}" || exit 4
 
-# ONE srun, all ${SNOWBALL_STEPS} steps. Steps 1-6 are observed, never a stopping point.
+# One srun for the complete requested stage budget.
 srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores \
   "${MARIN_PYTHON}" -m experiments.june_tpu_67b_a2b.moe.vista_snowball_chat train \
     --init-checkpoint-path "${SNOWBALL_INIT}" --data-cache-path "${SNOWBALL_CACHE}" \

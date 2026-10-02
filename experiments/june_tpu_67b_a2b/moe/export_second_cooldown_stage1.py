@@ -1,3 +1,6 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import math
 from typing import Any, cast
@@ -17,11 +20,7 @@ from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig as VendoredGr
 from experiments.june_tpu_67b_a2b.moe.model import Transformer as VendoredTransformer
 from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
 
-CHECKPOINT = (
-    "s3://marin-us-east-02a/marin/grug/"
-    "snowball_step105149_sft_s1_chat/"
-    "2026.08.13.1/checkpoints/step-257/"
-)
+CHECKPOINT = "s3://marin-us-east-02a/marin/grug/" "snowball_step105149_sft_s1_chat/" "2026.08.13.1/checkpoints/step-257/"
 OUTPUT = "s3://marin-us-east-02a/marin/exports/grug/snowball_step105149_sft_s1_chat/2026.08.13.1/step-257/hf-bf16-vllm/"
 
 qk_mult = 1.3 * (0.1 * math.log(65_536 / 8_192) + 1.0)
@@ -80,7 +79,9 @@ with set_mesh(mesh):
         config=main_config,
     )
     tokenizer = load_tokenizer("marin-community/marin-tokenizer")
-    converter = main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16"})
+    converter = (
+        main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16"})
+    )
     converter.save_pretrained(
         export_model,
         OUTPUT,

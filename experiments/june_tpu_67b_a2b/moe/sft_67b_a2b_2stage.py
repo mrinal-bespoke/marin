@@ -182,7 +182,7 @@ _JOB2_DATASET = DatasetSpec(
     adapter_kwargs=dict(),  # multi_turn_adapter defaults: messages / role / user / assistant
     weight=1.0,
 )
-_NEMOTRON_TERMINAL_DATASET = DatasetSpec(
+NEMOTRON_TERMINAL_DATASET = DatasetSpec(
     slug="nemotron_terminal_full",
     hf_dataset_id="nvidia/Nemotron-Terminal-Corpus",
     revision="a1667c4",
@@ -260,12 +260,10 @@ _SECOND_COOLDOWN_CHAT_RUN_ID: str = "snowball_step105149_sft_s1_chat"
 _SECOND_COOLDOWN_THINKING_RUN_ID: str = "snowball_step105149_sft_s2_thinking"
 _SECOND_COOLDOWN_AGENTIC_RUN_ID: str = "snowball_step105149_sft_s3_agentic_eot_5ep"
 _SECOND_COOLDOWN_CHAT_CHECKPOINT: str = (
-    "s3://marin-us-east-02a/marin/grug/snowball_step105149_sft_s1_chat/"
-    "2026.08.13.1/checkpoints/"
+    "s3://marin-us-east-02a/marin/grug/snowball_step105149_sft_s1_chat/" "2026.08.13.1/checkpoints/"
 )
 _SECOND_COOLDOWN_THINKING_CHECKPOINT: str = (
-    "s3://marin-us-east-02a/marin/grug/snowball_step105149_sft_s2_thinking/"
-    "2026.08.13.1/checkpoints/"
+    "s3://marin-us-east-02a/marin/grug/snowball_step105149_sft_s2_thinking/" "2026.08.13.1/checkpoints/"
 )
 _AGENTIC_TRAIN_RESOURCES: str = "agentic_train_resources"
 _AGENTIC_EPOCHS: int = 5
@@ -441,7 +439,7 @@ def build_nemotron_terminal(
     spec = _spec(
         name=user_namespaced_name(step_name, version),
         version=version,
-        dataset=_NEMOTRON_TERMINAL_DATASET,
+        dataset=NEMOTRON_TERMINAL_DATASET,
         model_source=_grug_source(
             _SNOWBALL_STEP105149_CKPT,
             stage="nemotron_terminal",

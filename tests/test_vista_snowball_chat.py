@@ -5,8 +5,14 @@ import json
 import math
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
+from experiments.june_tpu_67b_a2b.moe.rechunk_nemotron_terminal import (
+    parquet_content_digest,
+    rechunk_parquet,
+)
 from experiments.june_tpu_67b_a2b.moe.sft_67b_a2b_2stage import _model as ORIGINAL_MODEL_CONFIG
 from experiments.june_tpu_67b_a2b.moe.sft_67b_a2b_2stage import _optimizer as ORIGINAL_OPTIMIZER
 from experiments.june_tpu_67b_a2b.moe.vista_snowball_chat import (
@@ -22,13 +28,18 @@ from experiments.june_tpu_67b_a2b.moe.vista_snowball_chat import (
     SNOWBALL_CHAT_STEPS,
     SNOWBALL_CHAT_TOKENS,
     SNOWBALL_NATIVE_PARAMETERS,
+    STAGES,
     expected_chat_steps,
+    snowball_chat_data_config,
     snowball_chat_format,
+    validate_cache_provenance,
     validate_chat_cache_layout,
     validate_chat_epoch,
     validate_native_checkpoint_layout,
     vista_trainer_mesh_config,
+    write_cache_provenance,
 )
+from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
 from experiments.sft.delphi_chat_template import DELPHI_V0_CHAT_TEMPLATE
 
 
@@ -57,6 +68,66 @@ def test_vista_recipe_matches_snowball_chat_contract() -> None:
     assert fmt.chat_template == DELPHI_V0_CHAT_TEMPLATE
     assert fmt.mask_user_turns
     assert fmt.pack is None
+
+
+def test_stage3_reference_and_historical_hybrid_are_not_conflated() -> None:
+    historical = STAGES["nemotron_terminal"]
+    reference = STAGES["nemotron_terminal_reference"]
+
+    assert historical.init_step == 630
+    assert historical.optimizer.learning_rate == 5e-5
+    assert reference.init_step == 0
+    assert reference.optimizer.learning_rate == 5e-6
+    assert reference.optimizer.adam_lr == 5e-6
+    assert historical.provenance_stage == reference.provenance_stage == "nemotron_terminal"
+    config = snowball_chat_data_config(
+        cache_path="/cache", tokenizer_path="/tokenizer", stage="nemotron_terminal_reference"
+    )
+    assert config.chat_template == MARIN_CHAT_TEMPLATE
+
+
+def test_cache_provenance_rejects_wrong_dataset_identity(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    tokenizer = tmp_path / "tokenizer"
+    shard = tmp_path / "source" / "part.parquet"
+    cache.mkdir()
+    tokenizer.mkdir()
+    shard.parent.mkdir()
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    shard.write_bytes(b"parquet")
+    write_cache_provenance(
+        cache_path=str(cache),
+        stage="chat",
+        dataset_id="wrong/dataset",
+        dataset_revision=STAGES["chat"].dataset_revision,
+        shard_paths=[str(shard)],
+        tokenizer_path=str(tokenizer),
+    )
+
+    with pytest.raises(ValueError, match="wrong/dataset"):
+        validate_cache_provenance(str(cache), "chat", str(tokenizer))
+
+
+def test_rechunk_parquet_preserves_nested_rows(tmp_path: Path) -> None:
+    source = tmp_path / "source.parquet"
+    derived = tmp_path / "derived.parquet"
+    rows = [
+        {
+            "conversations": [
+                {"role": "user", "content": f"question {index}"},
+                {"role": "assistant", "content": f"answer {index}"},
+            ],
+            "index": index,
+        }
+        for index in range(7)
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), source, row_group_size=7)
+
+    record = rechunk_parquet(source, derived, row_group_size=2)
+
+    assert record["rows"] == 7
+    assert parquet_content_digest(source) == parquet_content_digest(derived)
+    assert pq.ParquetFile(derived).num_row_groups == 4
 
 
 def test_epoch_step_count_uses_packed_token_count() -> None:
